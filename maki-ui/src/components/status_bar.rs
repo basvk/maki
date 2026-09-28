@@ -28,6 +28,10 @@ const RESTRICTED_LABEL: &str = " [restricted]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_DIM_FACTOR: f32 = 0.15;
 
+/// Flashes are easy to miss when the eye is on the transcript, so the line
+/// lingers past the configured duration instead of vanishing mid read.
+const READ_GRACE: Duration = Duration::from_secs(5);
+
 pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once
     /// subagents make the two differ.
@@ -136,7 +140,7 @@ impl StatusBar {
         if self
             .flash
             .as_ref()
-            .is_none_or(|(_, t)| t.elapsed() < self.flash_duration)
+            .is_none_or(|(_, t)| t.elapsed() < self.flash_duration + READ_GRACE)
         {
             return Dirty::NO;
         }
@@ -155,10 +159,17 @@ impl StatusBar {
     /// a new moving span cannot forget to claim its frames.
     ///
     /// A queue claims frames too. Startup fills it and then the UI sits idle,
-    /// so without frames the next message would never get its turn.
+    /// so without frames the next message would never get its turn. A flash
+    /// that is up but not yet due is the same story: the tick that takes it
+    /// down is the one frame it still needs.
     pub fn cadence(&self, status: &Status, restoring: bool, retrying: bool) -> Cadence {
+        let waiting = !self.queued.is_empty()
+            || self
+                .flash
+                .as_ref()
+                .is_some_and(|(_, t)| t.elapsed() < self.flash_duration + READ_GRACE);
         Cadence::when(
-            *status == Status::Streaming || restoring || retrying || !self.queued.is_empty(),
+            *status == Status::Streaming || restoring || retrying || waiting,
             Cadence::SPINNER,
         )
     }
@@ -455,6 +466,21 @@ mod tests {
     /// Long enough that the countdown cannot lapse mid-render.
     const RETRY_DELAY: Duration = Duration::from_secs(600);
 
+    /// Pushes the flash's timestamp back by this much, standing in for time
+    /// passing. A test can then reach a deadline without waiting for it.
+    trait AgeFlash {
+        fn ago(self, bar: &mut StatusBar);
+    }
+
+    impl AgeFlash for Duration {
+        fn ago(self, bar: &mut StatusBar) {
+            bar.flash = bar
+                .flash
+                .take()
+                .map(|(msg, now)| (msg, now - self));
+        }
+    }
+
     fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
         render_status(&Status::Idle, global_cost, show_global, yolo)
     }
@@ -624,21 +650,34 @@ mod tests {
     }
 
     /// Once the flash is gone nothing clears the debt, so only the tick that
-    /// removes it may report a change, or the loop never settles. The two
-    /// lifetimes stand in for time passing: rewinding an `Instant` by an hour
-    /// panics on a machine that booted less than an hour ago.
-    #[test_case(false, FLASH_TTL      => Dirty::NO  ; "no_flash")]
-    #[test_case(true,  FLASH_TTL      => Dirty::NO  ; "flash_still_visible")]
-    #[test_case(true,  Duration::ZERO => Dirty::YES ; "flash_expired")]
-    fn clear_expired_hint_owes_the_frame_only_once(flashing: bool, ttl: Duration) -> Dirty {
-        let mut bar = StatusBar::new(ttl);
+    /// removes it may report a change, or the loop never settles. Aging the
+    /// flash stands in for time passing: a fake clock is not worth owning for
+    /// one predicate.
+    #[test_case(false, Duration::ZERO => Dirty::NO  ; "no_flash")]
+    #[test_case(true,  Duration::ZERO => Dirty::NO  ; "flash_still_visible")]
+    #[test_case(true,  READ_GRACE     => Dirty::YES ; "flash_expired")]
+    fn clear_expired_hint_owes_the_frame_only_once(flashing: bool, age: Duration) -> Dirty {
+        let mut bar = StatusBar::new(Duration::ZERO);
         if flashing {
             bar.flash(FLASH_MSG.into());
+            age.ago(&mut bar);
         }
 
         let first = bar.clear_expired_hint();
         assert_eq!(bar.clear_expired_hint(), Dirty::NO, "{QUIET}");
         first
+    }
+
+    /// The line has to outlive the configured duration, or a message arrives
+    /// and leaves before the eye gets to it.
+    #[test_case(READ_GRACE - Duration::from_millis(1) => Dirty::NO  ; "gone_but_still_readable")]
+    #[test_case(READ_GRACE                            => Dirty::YES ; "grace_is_up")]
+    fn flash_outlives_its_duration_by_the_grace_period(age: Duration) -> Dirty {
+        let mut bar = StatusBar::new(Duration::ZERO);
+        bar.flash(FLASH_MSG.into());
+        age.ago(&mut bar);
+
+        bar.clear_expired_hint()
     }
 
     /// A toggle says what just happened, and the user is looking when it
@@ -653,8 +692,8 @@ mod tests {
         assert_eq!(bar.flash_text(), Some("disabled"), "{EXPECT_NEWEST}");
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
-            "{EXPECT_IDLE}"
+            Cadence::SPINNER,
+            "{EXPECT_TICKING}"
         );
     }
 
@@ -670,6 +709,7 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..msgs.len() {
             seen.push(bar.flash_text().expect(EXPECT_FLASH).to_owned());
+            READ_GRACE.ago(&mut bar);
             let _ = bar.clear_expired_hint();
         }
 
@@ -683,8 +723,8 @@ mod tests {
         bar.queue_flash(FLASH_MSG.into());
         assert_eq!(
             bar.cadence(&Status::Idle, false, false),
-            Cadence::IDLE,
-            "{EXPECT_IDLE}"
+            Cadence::SPINNER,
+            "{EXPECT_TICKING}"
         );
 
         bar.queue_flash(FLASH_MSG.into());
